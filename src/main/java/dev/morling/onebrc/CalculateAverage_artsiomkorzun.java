@@ -34,7 +34,6 @@ public class CalculateAverage_artsiomkorzun {
 
     private static final Path FILE = Path.of("./measurements.txt");
     private static final long SEGMENT_SIZE = 4 * 1024 * 1024;
-    private static final long SEGMENT_OVERLAP = 128;
     private static final long COMMA_PATTERN = 0x3B3B3B3B3B3B3B3BL;
     private static final long DOT_BITS = 0x10101000;
     private static final long MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
@@ -363,15 +362,19 @@ public class CalculateAverage_artsiomkorzun {
 
             for (int segment; (segment = counter.getAndIncrement()) < segmentCount;) {
                 long position = SEGMENT_SIZE * segment;
-                long size = Math.min(SEGMENT_SIZE + SEGMENT_OVERLAP, fileSize - position);
-                long address = fileAddress + position;
-                long limit = address + Math.min(SEGMENT_SIZE, size - 1);
+                long size = Math.min(SEGMENT_SIZE, fileSize - position - 1);
+                long start = fileAddress + position;
+                long end = start + size;
 
                 if (segment > 0) {
-                    address = next(address);
+                    start = next(start);
                 }
 
-                aggregate(aggregates, address, limit);
+                long chunk = (end - start) / 3;
+                long left = next(start + chunk);
+                long right = next(start + chunk + chunk);
+
+                aggregate(aggregates, start, left - 1, left, right - 1, right, end);
             }
 
             while (!result.compareAndSet(null, aggregates)) {
@@ -383,86 +386,124 @@ public class CalculateAverage_artsiomkorzun {
             }
         }
 
-        private static void aggregate(Aggregates aggregates, long position, long limit) {
-            // this parsing can produce seg fault at page boundaries
-            // e.g. file size is 4096 and the last entry is X=0.0, which is less than 8 bytes
-            // as a result a read will be split across pages, where one of them is not mapped
-            // but for some reason it works on my machine, leaving to investigate
+        private static long next(long position) {
+            while (UNSAFE.getByte(position++) != '\n') {
+                // continue
+            }
+            return position;
+        }
 
-            while (position <= limit) { // branchy version, credit: thomaswue
-                int length;
-                int hash;
+        private static void aggregate(Aggregates aggregates, long position1, long limit1, long position2, long limit2, long position3, long limit3) {
+            while (position1 <= limit1 && position2 <= limit2 && position3 <= limit3) {
+                long word1 = word(position1);
+                long word2 = word(position2);
+                long word3 = word(position3);
 
-                long word = word(position);
-                long separator = separator(word);
+                long separator1 = separator(word1);
+                long separator2 = separator(word2);
+                long separator3 = separator(word3);
 
-                if (separator != 0) {
-                    length = length(separator);
-                    word = mask(word, separator);
-                    hash = mix(word);
-                    long ptr = aggregates.find(word, hash);
+                position1 = process(aggregates, position1, word1, separator1);
+                position2 = process(aggregates, position2, word2, separator2);
+                position3 = process(aggregates, position3, word3, separator3);
+            }
 
-                    if (ptr != 0) {
-                        position = update(ptr, position + length);
-                        continue;
-                    }
-                }
-                else {
-                    long word0 = word;
-                    word = word(position + 8);
-                    separator = separator(word);
+            while (position1 <= limit1) {
+                long word1 = word(position1);
+                long separator1 = separator(word1);
+                position1 = process(aggregates, position1, word1, separator1);
+            }
 
-                    if (separator != 0) {
-                        length = length(separator) + 8;
-                        word = mask(word, separator);
-                        hash = mix(word ^ word0);
-                        long ptr = aggregates.find(word0, word, hash);
+            while (position2 <= limit2) {
+                long word2 = word(position2);
+                long separator2 = separator(word2);
+                position2 = process(aggregates, position2, word2, separator2);
+            }
 
-                        if (ptr != 0) {
-                            position = update(ptr, position + length);
-                            continue;
-                        }
-                    }
-                    else {
-                        length = 16;
-                        long h = word ^ word0;
-
-                        while (true) {
-                            word = word(position + length);
-                            separator = separator(word);
-
-                            if (separator == 0) {
-                                length += 8;
-                                h ^= word;
-                                continue;
-                            }
-
-                            length += length(separator);
-                            word = mask(word, separator);
-                            hash = mix(h ^ word);
-                            break;
-                        }
-                    }
-                }
-
-                long ptr = aggregates.put(position, word, length, hash);
-                position = update(ptr, position + length);
+            while (position3 <= limit3) {
+                long word3 = word(position3);
+                long separator3 = separator(word3);
+                position3 = process(aggregates, position3, word3, separator3);
             }
         }
 
-        private static long update(long ptr, long position) {
-            // idea: merykitty
-            long word = word(position);
-            long inverted = ~word;
-            int dot = Long.numberOfTrailingZeros(inverted & DOT_BITS);
-            long signed = (inverted << 59) >> 63;
-            long mask = ~(signed & 0xFF);
-            long digits = ((word & mask) << (28 - dot)) & 0x0F000F0F00L;
-            long abs = ((digits * MAGIC_MULTIPLIER) >>> 32) & 0x3FF;
-            int value = (int) ((abs ^ signed) - signed);
+        private static long process(Aggregates aggregates, long position, long word, long separator) {
+            long end = position;
 
-            Aggregates.update(ptr, value);
-            return position + (dot >> 3) + 3;
+            int length;
+            int hash;
+            int value;
+
+            if (separator != 0) {
+                length = length(separator);
+                word = mask(word, separator);
+                hash = mix(word);
+                end += length;
+
+                long num = word(end);
+                int dot = dot(num);
+                value = value(num, dot);
+                end += (dot >> 3) + 3;
+                long pointer = aggregates.find(word, hash);
+
+                if (pointer != 0) {
+                    Aggregates.update(pointer, value);
+                    return end;
+                }
+            }
+            else {
+                long word0 = word;
+                word = word(end + 8);
+                separator = separator(word);
+
+                if (separator != 0) {
+                    length = length(separator) + 8;
+                    word = mask(word, separator);
+                    hash = mix(word ^ word0);
+                    end += length;
+
+                    long num = word(end);
+                    int dot = dot(num);
+                    value = value(num, dot);
+                    end += (dot >> 3) + 3;
+                    long pointer = aggregates.find(word0, word, hash);
+
+                    if (pointer != 0) {
+                        Aggregates.update(pointer, value);
+                        return end;
+                    }
+                }
+                else {
+                    length = 16;
+                    long h = word ^ word0;
+
+                    while (true) {
+                        word = word(end + length);
+                        separator = separator(word);
+
+                        if (separator == 0) {
+                            length += 8;
+                            h ^= word;
+                            continue;
+                        }
+
+                        length += length(separator);
+                        word = mask(word, separator);
+                        hash = mix(h ^ word);
+                        end += length;
+
+                        long num = word(end);
+                        int dot = dot(num);
+                        value = value(num, dot);
+                        end += (dot >> 3) + 3;
+                        break;
+                    }
+                }
+            }
+
+            long pointer = aggregates.put(position, word, length, hash);
+            Aggregates.update(pointer, value);
+            return end;
         }
 
         private static long separator(long word) {
@@ -479,17 +520,24 @@ public class CalculateAverage_artsiomkorzun {
             return (Long.numberOfTrailingZeros(separator) >>> 3) + 1;
         }
 
-        private static long next(long position) {
-            while (UNSAFE.getByte(position++) != '\n') {
-                // continue
-            }
-            return position;
-        }
-
         private static int mix(long x) {
             long h = x * -7046029254386353131L;
-            h ^= h >>> 32;
-            return (int) (h ^ h >>> 16);
+            h ^= h >>> 35;
+            return (int) h;
+            // h ^= h >>> 32;
+            // return (int) (h ^ h >>> 16);
+        }
+
+        private static int dot(long num) {
+            return Long.numberOfTrailingZeros(~num & DOT_BITS);
+        }
+
+        private static int value(long w, int dot) {
+            long signed = (~w << 59) >> 63;
+            long mask = ~(signed & 0xFF);
+            long digits = ((w & mask) << (28 - dot)) & 0x0F000F0F00L;
+            long abs = ((digits * MAGIC_MULTIPLIER) >>> 32) & 0x3FF;
+            return (int) ((abs ^ signed) - signed);
         }
     }
 }
